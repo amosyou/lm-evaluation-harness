@@ -17,6 +17,16 @@ from lm_eval.utils import (
     make_disjoint_window,
 )
 
+import torch
+import flash_bpe
+from rs import SimpleTokenizer
+from concurrent.futures import ThreadPoolExecutor
+import time
+import tiktoken
+import base64
+from huggingface_hub import hf_hub_download
+import json
+
 
 eval_logger = logging.getLogger(__name__)
 
@@ -27,6 +37,38 @@ except ModuleNotFoundError:
 
 if TYPE_CHECKING:
     pass
+
+def flatten_with_sublist_offsets(nested_list):
+    flat_list = []
+    offsets = []
+    
+    current_index = 0
+    for sublist in nested_list:
+        offsets.append(current_index)
+        flat_list.extend(sublist)
+        current_index += len(sublist)
+    
+    return flat_list, offsets
+
+class Object(object):
+    pass
+
+def encode(batch, lookup, bpe, num_threads, padding_token_id=128009):
+
+    with ThreadPoolExecutor(max_workers=num_threads) as pool:
+        # results = list(pool.map(lookup.encode_ordinary, batch))
+        results = list(pool.map(lookup.encode, batch))
+        results = [[128000] + x for x in results]
+        lengths = list(pool.map(len, results))
+        global_length = sum(lengths)
+        batch_size = len(lengths)
+        flattened, offsets = flatten_with_sublist_offsets(results)
+    
+    ids, attn_mask = bpe.process(flattened, offsets, lengths, global_length, batch_size, padding_token_id)
+    obj = Object()
+    obj.input_ids = ids
+    obj.attn_mask = attn_mask
+    return obj
 
 
 @register_model("sglang")
@@ -108,6 +150,27 @@ class SGLangLM(TemplateLM):
 
         # Todo(Jinwei): check tokenizer and other settings.
         self.tokenizer = self.model.tokenizer_manager.tokenizer
+        self.tokenizer.encode_batch = encode
+        # TODO: modified here
+        self.bpe = flash_bpe.BPE("/home/ubuntu/flash-bpe/llama3_merge.bin")
+
+        mergeable_ranks = {}
+        with open('/home/ubuntu/flash-bpe/tokenizer.model', 'r') as f:
+            lines = f.readlines()
+
+        for i, line in enumerate(lines):
+            token, rank = line.split()
+            mergeable_ranks[base64.b64decode(token)] = int(rank)
+        
+        with open(hf_hub_download("meta-llama/Llama-3.1-8B-Instruct", filename="tokenizer.json"), 'r') as f:
+            tokenizer_json = json.load(f)
+
+        special_tokens = {d["content"]: d["id"] for d in tokenizer_json["added_tokens"]}
+
+        self.lookup = SimpleTokenizer(
+            mergeable_ranks,
+            special_tokens,
+        )
         self._max_gen_toks = max_gen_toks
         self.add_bos_token = add_bos_token
         if "gemma" in pretrained.lower():
@@ -116,6 +179,7 @@ class SGLangLM(TemplateLM):
                 "Found 'gemma' in model name, a BOS token will be used as Gemma series models underperform without it."
             )
         self.custom_prefix_token_id = prefix_token_id
+
 
     def loglikelihood_rolling(
         self, requests: List[Instance], disable_tqdm: bool = False
@@ -347,12 +411,22 @@ class SGLangLM(TemplateLM):
     ) -> Union[List[int], List[List[int]]]:
         if not add_special_tokens:
             add_special_tokens = False or self.add_bos_token
-        encoding: Union[List[List[int]], List[int]] = self.tokenizer(
-            string,
-            add_special_tokens=add_special_tokens,
-            truncation=truncation,
-            return_attention_mask=False,
-        ).input_ids
+        # encoding: Union[List[List[int]], List[int]] = self.tokenizer(
+        #     string,
+        #     add_special_tokens=add_special_tokens,
+        #     truncation=truncation,
+        #     return_attention_mask=False,
+        # ).input_ids
+        if isinstance(string, str):
+            encoding = self.tokenizer.encode_batch(
+                [string], self.lookup, self.bpe, 128
+            ).input_ids
+            encoding = encoding[0].tolist()
+        else:
+            encoding = self.tokenizer.encode_batch(
+                string, self.lookup, self.bpe, 128
+            ).input_ids
+            encoding = encoding.tolist()
 
         # left-truncate the encoded context to be at most `left_truncate_len` tokens long
         if left_truncate_len:
